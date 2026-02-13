@@ -10,19 +10,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          playwright install
+          python -m playwright install --with-deps chromium
 
+      # ★ GitHub Secret から credentials.json を作成
+      - name: Create credentials file
+        run: |
+          printf '%s' "${{ secrets.GOOGLE_CREDENTIALS }}" > credentials.json
+
+      # ★ 動作確認（中身は表示しない）
+      - name: Verify credentials file
+        run: |
+          ls -la
+          test -s credentials.json && echo "credentials.json created"
+
+      # ★ スクリプト実行
       - name: Run script
         run: python main.py
         env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_APPLICATION_CREDENTIALS: credentials.json
