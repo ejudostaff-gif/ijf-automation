@@ -38,14 +38,13 @@ jobs:
           PYTHONUNBUFFERED: "1"
 
           # ===== あなたのスプレッドシート設定 =====
-          SPREADSHEET_URL: https://docs.google.com/spreadsheets/d/1SwjfDRfcikHrNo38CgFjwBa_oWQM5pnGynFeqikeVU4/edit?gid=249463213#gid=249463213
-          
+          SPREADSHEET_URL: https://docs.google.com/spreadsheets/d/1SwjfDRfcikHrNo38CgFjwBa_oWQM5pnGynFeqikeVU4
           # タブ名（見ているシート名に合わせる）
           SHEET_NAME: データベース
 
           # データ範囲
           START_ROW: 2
-          END_ROW: 1000
+          END_ROW: 3175
 
           # 1回あたりの処理件数
           BATCH_SIZE: 100
