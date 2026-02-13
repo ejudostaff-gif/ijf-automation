@@ -124,7 +124,7 @@ def open_worksheet(client) -> gspread.Worksheet:
 
 # ===== Main =====
 def main():
-    print("=== START main() ===")
+    print("=== START main() ===", flush=True)
 
     cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
     print("Credential path:", cred_path)
