@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
       - name: Setup Python
         uses: actions/setup-python@v4
@@ -22,14 +23,29 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      # Google認証ファイル作成
       - name: Create credentials file
         run: |
           cat > credentials.json << 'EOF'
           ${{ secrets.GOOGLE_CREDENTIALS }}
           EOF
 
+      # 実行
       - name: Run script
         run: python -u main.py
         env:
           GOOGLE_APPLICATION_CREDENTIALS: credentials.json
           PYTHONUNBUFFERED: "1"
+
+          # ===== あなたのスプレッドシート設定 =====
+          SPREADSHEET_URL: https://docs.google.com/spreadsheets/d/1SwjfDRfcikHrNo38CgFjwBa_oWQM5pnGynFeqikeVU4/edit?gid=249463213#gid=249463213
+          
+          # タブ名（見ているシート名に合わせる）
+          SHEET_NAME: データベース
+
+          # データ範囲
+          START_ROW: 2
+          END_ROW: 1000
+
+          # 1回あたりの処理件数
+          BATCH_SIZE: 100
