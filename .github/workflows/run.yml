@@ -29,6 +29,7 @@ jobs:
           EOF
 
       - name: Run script
-        run: python main.py
+        run: python -u main.py
         env:
           GOOGLE_APPLICATION_CREDENTIALS: credentials.json
+          PYTHONUNBUFFERED: "1"
