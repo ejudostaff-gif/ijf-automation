@@ -2,117 +2,138 @@ import os
 import re
 import time
 from typing import Optional, List, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import urlencode
 
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
 from bs4 import BeautifulSoup
 
-# ====== 設定 ======
-SPREADSHEET_URL = os.environ.get("SPREADSHEET_URL", "").strip()
-SHEET_NAME = os.environ.get("SHEET_NAME", "").strip()  # 空なら先頭シート
-START_ROW = int(os.environ.get("START_ROW", "2"))       # データ開始行（ヘッダ除外なら2）
-END_ROW = int(os.environ.get("END_ROW", "1000"))        # 例: 1000
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))   # 100ずつ
-SLEEP_SEC = float(os.environ.get("SLEEP_SEC", "1.0"))   # 連打しない
 
-# 列指定（あなたの要件：F→検索値、Q→IJF URL）
+# ====== 環境変数から設定（run.yml の env で渡す） ======
+SPREADSHEET_URL = os.environ.get("SPREADSHEET_URL", "").strip()
+SHEET_NAME = os.environ.get("SHEET_NAME", "").strip()            # 例: "データベース"（空なら先頭タブ）
+START_ROW = int(os.environ.get("START_ROW", "2"))                # データ開始行（ヘッダー除外なら2）
+END_ROW = int(os.environ.get("END_ROW", "1000"))                 # 例: 1000
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))            # 例: 100
+SLEEP_SEC = float(os.environ.get("SLEEP_SEC", "0.8"))            # 連続アクセス抑制（0.5〜1.5推奨）
+
+# 列（固定：F→検索値、Q→IJF URL）
 COL_F = 6
 COL_Q = 17
 
-IJF_SEARCH_URL = "https://www.ijf.org/search"  # group=competitors&q=... を付ける  [oai_citation:1‡国際柔道連盟](https://www.ijf.org/search?group=competitors&p=1&q=)
+IJF_SEARCH_URL = "https://www.ijf.org/search"
+IJF_BASE = "https://www.ijf.org"
 IJF_JUDOKA_PREFIX = "https://www.ijf.org/judoka/"
 
 
-def normalize_name(raw: str) -> str:
-    """余計な空白を潰し、, を除去して単語列として整形"""
+# ====== ユーティリティ ======
+def normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def queries_from_fcell(raw: str) -> List[str]:
+    """
+    ルール：
+    - F列はアルファベット
+    - F列は , を削除して検索
+    - 可能なら姓名を入れ替えた検索も試す
+      例: "SCUTTO, Assunta" -> ["SCUTTO Assunta", "Assunta SCUTTO"]
+          "SILVA DE FREITAS, Bruna Vanessa" -> ["SILVA DE FREITAS Bruna Vanessa", "Bruna Vanessa SILVA DE FREITAS"]
+    - カンマ無しは安全のため入れ替えはしない（複合姓で誤爆しやすい）
+    """
     s = (raw or "").strip()
-    # 末尾/先頭空白を潰し、カンマは消す（ユーザー要件）
-    s = s.replace(",", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def build_queries_from_fcell(raw_f: str) -> List[str]:
-    """
-    F列が "SURNAME, Given Names" か "SURNAME Given" か混在しても、
-    できるだけ落とさずに検索語を作る。
-    ルール：カンマ削除＋（入れ替え）も試す
-    """
-    s = (raw_f or "").strip()
     if not s:
         return []
 
-    # まずユーザー要件通り「, を削除して検索」
-    normalized = normalize_name(s)
-
-    # もし元が "SURNAME, Given..." 形式なら、入れ替えも作る
-    # 例: "SCUTTO, Assunta" -> ["SCUTTO Assunta", "Assunta SCUTTO"]
-    # 例: "SILVA DE FREITAS, Bruna Vanessa" -> ["SILVA DE FREITAS Bruna Vanessa", "Bruna Vanessa SILVA DE FREITAS"]
     if "," in s:
-        parts = [p.strip() for p in s.split(",", 1)]
-        surname = normalize_name(parts[0])
-        given = normalize_name(parts[1]) if len(parts) > 1 else ""
-        if surname and given:
-            return [
-                f"{surname} {given}".strip(),
-                f"{given} {surname}".strip(),
-            ]
-        return [normalized]
+        last, first = s.split(",", 1)
+        last = normalize_spaces(last.replace(",", " "))
+        first = normalize_spaces(first.replace(",", " "))
+        q1 = normalize_spaces(f"{last} {first}")
+        q2 = normalize_spaces(f"{first} {last}")
+        if q1.lower() == q2.lower():
+            return [q1]
+        return [q1, q2]
 
-    # カンマ無しの場合は、入れ替えは「単純に最後のトークンを姓とみなす」等は危険なので基本しない
-    # （複合姓が多く、誤爆が増える）
-    return [normalized]
+    # カンマ無し：そのまま（カンマ除去はしておく）
+    return [normalize_spaces(s.replace(",", " "))]
 
 
 def ijf_search_first_judoka_url(session: requests.Session, query: str) -> Optional[str]:
     """
-    IJF公式検索(competitors)を叩き、最初の /judoka/<id> を返す。
-    URL形式は /search?group=competitors&p=1&q=...  [oai_citation:2‡国際柔道連盟](https://www.ijf.org/search?group=competitors&p=1&q=)
+    IJFのcompetitors検索を叩いて、最初に見つかった /judoka/<id> を返す。
     """
-    q = (query or "").strip()
+    q = normalize_spaces(query)
     if not q:
         return None
 
-    params = {
-        "group": "competitors",
-        "p": "1",
-        "q": q,
-    }
-    resp = session.get(IJF_SEARCH_URL, params=params, timeout=30)
+    params = {"group": "competitors", "p": "1", "q": q}
+    url = IJF_SEARCH_URL + "?" + urlencode(params)
+
+    resp = session.get(url, timeout=30)
     if resp.status_code != 200:
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # /judoka/<id> へのリンクを拾う
-    # 例: https://www.ijf.org/judoka/51120 のような形式が実在  [oai_citation:3‡国際柔道連盟](https://www.ijf.org/judoka/51120)
     for a in soup.find_all("a", href=True):
-        href = a["href"]
+        href = a["href"].strip()
         if href.startswith("/judoka/"):
-            # /judoka/51120 -> https://www.ijf.org/judoka/51120
-            return "https://www.ijf.org" + href
+            return IJF_BASE + href
         if href.startswith(IJF_JUDOKA_PREFIX):
             return href
 
     return None
 
 
-def open_worksheet(gc: gspread.Client):
+def open_worksheet(gc: gspread.Client) -> gspread.Worksheet:
     if not SPREADSHEET_URL:
-        raise RuntimeError("SPREADSHEET_URL が空です（GitHub Actions の env に設定してください）")
+        raise RuntimeError("SPREADSHEET_URL が空です（run.yml の env に設定してください）")
+
     ss = gc.open_by_url(SPREADSHEET_URL)
     if SHEET_NAME:
         return ss.worksheet(SHEET_NAME)
     return ss.get_worksheet(0)
 
 
+def get_column_values_padded(ws: gspread.Worksheet, col_letter: str, start_row: int, end_row: int) -> List[List[str]]:
+    """
+    ws.get("F2:F1000") などは末尾の空行を返さないことがあるため、
+    指定行数まで [] でパディングして長さを揃える。
+    戻り値は2次元リスト（例: [["A"], [], ["B"] ...]）
+    """
+    rng = f"{col_letter}{start_row}:{col_letter}{end_row}"
+    vals = ws.get(rng)
+    expected = end_row - start_row + 1
+    if len(vals) < expected:
+        vals = vals + ([[]] * (expected - len(vals)))
+    return vals
+
+
+def update_q_cells(ws: gspread.Worksheet, updates: List[Tuple[int, str]]) -> None:
+    """
+    updates: [(row, url), ...] を Q列に書き込み
+    """
+    if not updates:
+        return
+
+    cells = []
+    for row, url in updates:
+        # 既存セルオブジェクトを作って値をセット
+        c = gspread.Cell(row, COL_Q, url)
+        cells.append(c)
+
+    ws.update_cells(cells, value_input_option="RAW")
+    print(f"Updated {len(updates)} cells in Q", flush=True)
+
+
 def main():
-    print("=== START main() ===")
+    print("=== START main() ===", flush=True)
+
     cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
-    print(f"Credential path: {cred_path}")
-    print(f"Credential exists: {os.path.exists(cred_path)}")
+    print("Credential path:", cred_path, flush=True)
+    print("Credential exists:", os.path.exists(cred_path), flush=True)
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -120,85 +141,79 @@ def main():
     ]
     creds = Credentials.from_service_account_file(cred_path, scopes=scopes)
     gc = gspread.authorize(creds)
-    print("Authorized Google client")
+    print("Authorized Google client", flush=True)
 
     ws = open_worksheet(gc)
-    print("Opened worksheet")
+    print("Opened worksheet:", ws.title, flush=True)
 
-    # 読み取り範囲：F列とQ列
-    end_row = max(START_ROW, END_ROW)
-    rng_f = f"F{START_ROW}:F{end_row}"
-    rng_q = f"Q{START_ROW}:Q{end_row}"
-    f_vals = ws.get(rng_f)
-    q_vals = ws.get(rng_q)
+    start = START_ROW
+    end = max(START_ROW, END_ROW)
 
-    # 対象行（Qが空で、Fがある）
+    # F列とQ列を取得（末尾空行は返らないのでパディング）
+    f_vals = get_column_values_padded(ws, "F", start, end)
+    q_vals = get_column_values_padded(ws, "Q", start, end)
+
+    expected_len = end - start + 1
+
+    # 対象：Fがあり、Qが空
     targets: List[Tuple[int, str]] = []
-    for i in range(len(f_vals)):
-        row = START_ROW + i
+    for i in range(expected_len):
+        row = start + i
         fcell = (f_vals[i][0] if f_vals[i] else "").strip()
         qcell = (q_vals[i][0] if q_vals[i] else "").strip()
+
         if not fcell:
             continue
-        # ヘッダっぽい行を除外（任意）
-        if row == 2 and fcell.lower() == "name":
+        # ヘッダー除外（Nameなど）
+        if fcell.lower() == "name":
             continue
         if qcell:
             continue
+
         targets.append((row, fcell))
 
-    print(f"Targets found: {len(targets)}")
+    print(f"Targets found: {len(targets)}", flush=True)
+    if not targets:
+        print("No targets. Done.", flush=True)
+        return
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; ijf-sheet-bot/1.0)"
-    })
+    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; ijf-sheet-bot/1.0)"})
 
-    updates = []
+    updates_batch: List[Tuple[int, str]] = []
     checked = 0
+    found = 0
 
     for row, raw_name in targets:
         checked += 1
-        print(f"Processing row {row}: {raw_name}")
+        qs = queries_from_fcell(raw_name)
 
-        queries = build_queries_from_fcell(raw_name)
-        found_url = None
-
-        for q in queries:
-            print(f"Searching IJF competitors: {q}")
-            found_url = ijf_search_first_judoka_url(session, q)
-            if found_url:
+        got = None
+        for q in qs:
+            print(f"Search IJF: row={row} q='{q}'", flush=True)
+            got = ijf_search_first_judoka_url(session, q)
+            if got:
                 break
             time.sleep(SLEEP_SEC)
 
-        if found_url:
-            print(f"FOUND: {found_url}")
-            updates.append((row, found_url))
+        if got:
+            found += 1
+            updates_batch.append((row, got))
+            print(f"FOUND: row={row} -> {got}", flush=True)
         else:
-            print("No match (leave blank)")
+            print(f"NOT FOUND: row={row} name='{raw_name}'", flush=True)
 
-        # 100件ごとにまとめて書き込み（速度＆API節約）
-        if len(updates) >= BATCH_SIZE:
-            apply_updates(ws, updates)
-            updates = []
-            print(f"checked: {checked}")
+        # バッチ書き込み
+        if len(updates_batch) >= BATCH_SIZE:
+            update_q_cells(ws, updates_batch)
+            updates_batch = []
+            print(f"Progress: checked={checked} found={found}", flush=True)
 
-    if updates:
-        apply_updates(ws, updates)
+    # 残りを反映
+    if updates_batch:
+        update_q_cells(ws, updates_batch)
 
-    print("=== DONE ===")
-
-
-def apply_updates(ws, updates: List[Tuple[int, str]]):
-    # Q列に書き込む
-    # gspread はまとめ書き込みが速いので、範囲ごとに分けずセル更新
-    cells = []
-    for row, url in updates:
-        cell = ws.cell(row, COL_Q)
-        cell.value = url
-        cells.append(cell)
-    ws.update_cells(cells, value_input_option="RAW")
-    print(f"Updated {len(updates)} cells in Q")
+    print(f"=== DONE checked={checked} found={found} ===", flush=True)
 
 
 if __name__ == "__main__":
