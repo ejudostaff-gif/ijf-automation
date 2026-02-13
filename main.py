@@ -1,299 +1,205 @@
 import os
-import time
 import re
-import traceback
-from typing import Optional, Tuple, List
+import time
+from typing import Optional, List, Tuple
+from urllib.parse import quote_plus
 
 import gspread
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+import requests
+from bs4 import BeautifulSoup
 
-# ===== 設定 =====
-SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1SwjfDRfcikHrNo38CgFjwBa_oWQM5pnGynFeqikeVU4"
-WORKSHEET_NAME = ""  # 対象タブが先頭でない場合はタブ名を入れる（例: "Sheet1"）
+# ====== 設定 ======
+SPREADSHEET_URL = os.environ.get("SPREADSHEET_URL", "").strip()
+SHEET_NAME = os.environ.get("SHEET_NAME", "").strip()  # 空なら先頭シート
+START_ROW = int(os.environ.get("START_ROW", "2"))       # データ開始行（ヘッダ除外なら2）
+END_ROW = int(os.environ.get("END_ROW", "1000"))        # 例: 1000
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))   # 100ずつ
+SLEEP_SEC = float(os.environ.get("SLEEP_SEC", "1.0"))   # 連打しない
 
-ROW_START = 1
-ROW_END = 5000
+# 列指定（あなたの要件：F→検索値、Q→IJF URL）
+COL_F = 6
+COL_Q = 17
 
-COL_F = 6    # 検索値（名前）
-COL_Q = 17   # IJF URL
-COL_R = 18   # judobase URL
-
-# 1回の実行で処理する最大件数（未入力行のみ）
-MAX_UPDATES_PER_RUN = 120
-
-# ブロック回避・安定性
-SLEEP_PER_PERSON_SEC = 1.0
-NAV_TIMEOUT_MS = 30000
-
-# ===== 正規表現 =====
-PROFILE_ID_RE = re.compile(r"/competitor/profile/(\d+)", re.I)
+IJF_SEARCH_URL = "https://www.ijf.org/search"  # group=competitors&q=... を付ける  [oai_citation:1‡国際柔道連盟](https://www.ijf.org/search?group=competitors&p=1&q=)
+IJF_JUDOKA_PREFIX = "https://www.ijf.org/judoka/"
 
 
-# ===== 文字列処理 =====
 def normalize_name(raw: str) -> str:
-    s = (raw or "").replace(",", " ").replace("，", " ")
+    """余計な空白を潰し、, を除去して単語列として整形"""
+    s = (raw or "").strip()
+    # 末尾/先頭空白を潰し、カンマは消す（ユーザー要件）
+    s = s.replace(",", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def swap_first_last(name: str) -> str:
-    parts = name.split()
-    if len(parts) < 2:
-        return name
-    return f"{parts[-1]} {parts[0]}"
+def build_queries_from_fcell(raw_f: str) -> List[str]:
+    """
+    F列が "SURNAME, Given Names" か "SURNAME Given" か混在しても、
+    できるだけ落とさずに検索語を作る。
+    ルール：カンマ削除＋（入れ替え）も試す
+    """
+    s = (raw_f or "").strip()
+    if not s:
+        return []
+
+    # まずユーザー要件通り「, を削除して検索」
+    normalized = normalize_name(s)
+
+    # もし元が "SURNAME, Given..." 形式なら、入れ替えも作る
+    # 例: "SCUTTO, Assunta" -> ["SCUTTO Assunta", "Assunta SCUTTO"]
+    # 例: "SILVA DE FREITAS, Bruna Vanessa" -> ["SILVA DE FREITAS Bruna Vanessa", "Bruna Vanessa SILVA DE FREITAS"]
+    if "," in s:
+        parts = [p.strip() for p in s.split(",", 1)]
+        surname = normalize_name(parts[0])
+        given = normalize_name(parts[1]) if len(parts) > 1 else ""
+        if surname and given:
+            return [
+                f"{surname} {given}".strip(),
+                f"{given} {surname}".strip(),
+            ]
+        return [normalized]
+
+    # カンマ無しの場合は、入れ替えは「単純に最後のトークンを姓とみなす」等は危険なので基本しない
+    # （複合姓が多く、誤爆が増える）
+    return [normalized]
 
 
-def build_queries(name: str) -> List[str]:
-    a = name
-    b = swap_first_last(name)
-    if b.lower() == a.lower():
-        return [a]
-    return [a, b]
-
-
-def extract_profile_id_from_url(url: str) -> Optional[str]:
-    if not url:
-        return None
-    m = PROFILE_ID_RE.search(url)
-    return m.group(1) if m else None
-
-
-# ===== judobase検索（UIクリック → URL/HTMLからIDを取る方式） =====
-def judobase_search_id(page, query: str) -> Optional[str]:
-    print(f"Searching judobase for: {query}", flush=True)
-
-    try:
-        page.goto(
-            "https://judobase.ijf.org/#/search",
-            wait_until="domcontentloaded",
-            timeout=NAV_TIMEOUT_MS,
-        )
-    except PWTimeoutError:
-        print("Timeout loading judobase search page", flush=True)
-        return None
-
-    page.wait_for_timeout(1500)
-
-    # 検索入力欄候補（UI変更に強め）
-    input_box = None
-    for sel in [
-        "input[type='search']",
-        "input[placeholder*='Search' i]",
-        "input[aria-label*='Search' i]",
-        "input",
-    ]:
-        try:
-            cand = page.query_selector(sel)
-            if cand:
-                input_box = cand
-                break
-        except Exception:
-            pass
-
-    if not input_box:
-        print("Search input not found", flush=True)
+def ijf_search_first_judoka_url(session: requests.Session, query: str) -> Optional[str]:
+    """
+    IJF公式検索(competitors)を叩き、最初の /judoka/<id> を返す。
+    URL形式は /search?group=competitors&p=1&q=...  [oai_citation:2‡国際柔道連盟](https://www.ijf.org/search?group=competitors&p=1&q=)
+    """
+    q = (query or "").strip()
+    if not q:
         return None
 
-    # 入力→Enter
-    try:
-        input_box.click()
-        input_box.fill(query)
-        input_box.press("Enter")
-    except Exception as e:
-        print("Search input error:", e, flush=True)
+    params = {
+        "group": "competitors",
+        "p": "1",
+        "q": q,
+    }
+    resp = session.get(IJF_SEARCH_URL, params=params, timeout=30)
+    if resp.status_code != 200:
         return None
 
-    # 結果描画待ち
-    page.wait_for_timeout(2500)
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    # 1) すでに profile に遷移しているなら URL から取る
-    pid = extract_profile_id_from_url(page.url)
-    if pid:
-        print(f"Found ID from URL: {pid}", flush=True)
-        return pid
+    # /judoka/<id> へのリンクを拾う
+    # 例: https://www.ijf.org/judoka/51120 のような形式が実在  [oai_citation:3‡国際柔道連盟](https://www.ijf.org/judoka/51120)
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("/judoka/"):
+            # /judoka/51120 -> https://www.ijf.org/judoka/51120
+            return "https://www.ijf.org" + href
+        if href.startswith(IJF_JUDOKA_PREFIX):
+            return href
 
-    # 2) 結果の「クリック可能っぽい」要素を広めに拾って1件目をクリック
-    click_selectors = [
-        "a[href*='competitor/profile']",
-        "a[href*='/competitor/profile/']",
-        "[role='link']",
-        "tbody tr",
-        "mat-row",
-        "mat-list-item",
-        "li",
-    ]
-
-    clicked = False
-    for sel in click_selectors:
-        try:
-            el = page.query_selector(sel)
-            if el:
-                el.click()
-                clicked = True
-                break
-        except Exception:
-            pass
-
-    if clicked:
-        page.wait_for_timeout(2000)
-
-        pid = extract_profile_id_from_url(page.url)
-        if pid:
-            print(f"Found ID after click (URL): {pid}", flush=True)
-            return pid
-
-        # URLに出なくてもHTMLから拾える場合がある
-        try:
-            html = page.content()
-            m = PROFILE_ID_RE.search(html)
-            if m:
-                print(f"Found ID after click (HTML): {m.group(1)}", flush=True)
-                return m.group(1)
-        except Exception:
-            pass
-
-    # 3) 最後の手段：ページHTMLから拾う
-    try:
-        html = page.content()
-        m = PROFILE_ID_RE.search(html)
-        if m:
-            print(f"Found ID from HTML: {m.group(1)}", flush=True)
-            return m.group(1)
-    except Exception:
-        pass
-
-    print("No ID found", flush=True)
     return None
 
 
-def get_urls_from_judobase(page, raw_name: str) -> Tuple[Optional[str], Optional[str]]:
-    name = normalize_name(raw_name)
-
-    # ヘッダーっぽい行をスキップ（必要なら増やせます）
-    if name.lower() in ("name",):
-        return None, None
-
-    if not name:
-        return None, None
-
-    for q in build_queries(name):
-        pid = judobase_search_id(page, q)
-        if pid:
-            r_url = f"https://judobase.ijf.org/#/competitor/profile/{pid}"
-            q_url = f"https://www.ijf.org/judoka/{pid}"
-            return q_url, r_url
-        page.wait_for_timeout(600)
-
-    return None, None
-
-
-# ===== Sheets =====
-def open_worksheet(client) -> gspread.Worksheet:
-    ss = client.open_by_url(SPREADSHEET_URL)
-    if WORKSHEET_NAME:
-        return ss.worksheet(WORKSHEET_NAME)
+def open_worksheet(gc: gspread.Client):
+    if not SPREADSHEET_URL:
+        raise RuntimeError("SPREADSHEET_URL が空です（GitHub Actions の env に設定してください）")
+    ss = gc.open_by_url(SPREADSHEET_URL)
+    if SHEET_NAME:
+        return ss.worksheet(SHEET_NAME)
     return ss.get_worksheet(0)
 
 
-def pad_list(lst: List[str], size: int) -> List[str]:
-    if len(lst) < size:
-        lst.extend([""] * (size - len(lst)))
-    return lst
-
-
-# ===== Main =====
 def main():
-    print("=== START main() ===", flush=True)
+    print("=== START main() ===")
+    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
+    print(f"Credential path: {cred_path}")
+    print(f"Credential exists: {os.path.exists(cred_path)}")
 
-    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-    print("Credential path:", cred_path, flush=True)
-    print("Credential exists:", os.path.exists(cred_path), flush=True)
-
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
     creds = Credentials.from_service_account_file(cred_path, scopes=scopes)
     gc = gspread.authorize(creds)
+    print("Authorized Google client")
 
-    print("Authorized Google client", flush=True)
     ws = open_worksheet(gc)
-    print("Opened worksheet", flush=True)
+    print("Opened worksheet")
 
-    n_rows = ROW_END - ROW_START + 1
+    # 読み取り範囲：F列とQ列
+    end_row = max(START_ROW, END_ROW)
+    rng_f = f"F{START_ROW}:F{end_row}"
+    rng_q = f"Q{START_ROW}:Q{end_row}"
+    f_vals = ws.get(rng_f)
+    q_vals = ws.get(rng_q)
 
-    f_vals = ws.col_values(COL_F)[ROW_START - 1 : ROW_END]
-    q_vals = ws.col_values(COL_Q)[ROW_START - 1 : ROW_END]
-    r_vals = ws.col_values(COL_R)[ROW_START - 1 : ROW_END]
-
-    pad_list(f_vals, n_rows)
-    pad_list(q_vals, n_rows)
-    pad_list(r_vals, n_rows)
-
-    # 未入力対象（Fあり & (Q空 or R空)）
-    targets: List[int] = []
-    for i in range(n_rows):
-        row = ROW_START + i
-        name = (f_vals[i] or "").strip()
-        if not name:
+    # 対象行（Qが空で、Fがある）
+    targets: List[Tuple[int, str]] = []
+    for i in range(len(f_vals)):
+        row = START_ROW + i
+        fcell = (f_vals[i][0] if f_vals[i] else "").strip()
+        qcell = (q_vals[i][0] if q_vals[i] else "").strip()
+        if not fcell:
             continue
-        q = (q_vals[i] or "").strip()
-        r = (r_vals[i] or "").strip()
-        if (not q) or (not r):
-            targets.append(row)
+        # ヘッダっぽい行を除外（任意）
+        if row == 2 and fcell.lower() == "name":
+            continue
+        if qcell:
+            continue
+        targets.append((row, fcell))
 
-    print("Targets found:", len(targets), flush=True)
-    if not targets:
-        print("No targets.", flush=True)
-        return
+    print(f"Targets found: {len(targets)}")
 
-    targets = targets[:MAX_UPDATES_PER_RUN]
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; ijf-sheet-bot/1.0)"
+    })
 
-    updates_q: List[Tuple[int, str]] = []
-    updates_r: List[Tuple[int, str]] = []
+    updates = []
+    checked = 0
 
-    print("Launching Playwright...", flush=True)
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
-        )
-        page = context.new_page()
+    for row, raw_name in targets:
+        checked += 1
+        print(f"Processing row {row}: {raw_name}")
 
-        for row in targets:
-            idx = row - ROW_START
-            raw_name = f_vals[idx]
-            cur_q = (q_vals[idx] or "").strip()
-            cur_r = (r_vals[idx] or "").strip()
+        queries = build_queries_from_fcell(raw_name)
+        found_url = None
 
-            print(f"Processing row {row}: {raw_name}", flush=True)
+        for q in queries:
+            print(f"Searching IJF competitors: {q}")
+            found_url = ijf_search_first_judoka_url(session, q)
+            if found_url:
+                break
+            time.sleep(SLEEP_SEC)
 
-            q_url, r_url = get_urls_from_judobase(page, raw_name)
+        if found_url:
+            print(f"FOUND: {found_url}")
+            updates.append((row, found_url))
+        else:
+            print("No match (leave blank)")
 
-            if q_url and not cur_q:
-                updates_q.append((row, q_url))
-            if r_url and not cur_r:
-                updates_r.append((row, r_url))
+        # 100件ごとにまとめて書き込み（速度＆API節約）
+        if len(updates) >= BATCH_SIZE:
+            apply_updates(ws, updates)
+            updates = []
+            print(f"checked: {checked}")
 
-            time.sleep(SLEEP_PER_PERSON_SEC)
+    if updates:
+        apply_updates(ws, updates)
 
-        context.close()
-        browser.close()
+    print("=== DONE ===")
 
-    print("Updating sheet...", flush=True)
 
-    if updates_q:
-        cells = [gspread.Cell(r, COL_Q, v) for r, v in updates_q]
-        ws.update_cells(cells, value_input_option="RAW")
-    if updates_r:
-        cells = [gspread.Cell(r, COL_R, v) for r, v in updates_r]
-        ws.update_cells(cells, value_input_option="RAW")
-
-    print(f"Updated Q: {len(updates_q)} / Updated R: {len(updates_r)} / Targets: {len(targets)}", flush=True)
-    print("=== DONE main() ===", flush=True)
+def apply_updates(ws, updates: List[Tuple[int, str]]):
+    # Q列に書き込む
+    # gspread はまとめ書き込みが速いので、範囲ごとに分けずセル更新
+    cells = []
+    for row, url in updates:
+        cell = ws.cell(row, COL_Q)
+        cell.value = url
+        cells.append(cell)
+    ws.update_cells(cells, value_input_option="RAW")
+    print(f"Updated {len(updates)} cells in Q")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        traceback.print_exc()
-        raise
+    main()
