@@ -1,91 +1,50 @@
-name: IJF Sheet Autofill (Flexible Columns)
+name: IJF Automation
 
 on:
   workflow_dispatch:
-    inputs:
-      spreadsheet_url:
-        description: "Google Sheets URL (https://docs.google.com/spreadsheets/d/....)"
-        required: true
-        type: string
-      sheet_name:
-        description: "Tab name (例: データベース). 空なら先頭タブ"
-        required: false
-        default: ""
-        type: string
-
-      # 範囲
-      start_row:
-        description: "Start row (例: 2)"
-        required: false
-        default: "2"
-        type: string
-      end_row:
-        description: "End row (例: 5000)"
-        required: false
-        default: "1000"
-        type: string
-
-      # 列（ここが拡張ポイント）
-      search_col:
-        description: "検索に使う列（例: F）"
-        required: false
-        default: "F"
-        type: string
-      output_col:
-        description: "書き込み先の列（例: Q）"
-        required: false
-        default: "Q"
-        type: string
-
-      # 実行制御
-      batch_size:
-        description: "Batch size per update (例: 100)"
-        required: false
-        default: "100"
-        type: string
-      sleep_sec:
-        description: "Sleep seconds between queries (例: 0.8)"
-        required: false
-        default: "0.8"
-        type: string
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
+    env:
+      # ====== 必須 ======
+      SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
+      SHEET_NAME: データベース
+
+      # ====== 列設定 ======
+      SEARCH_COL: F          # 検索対象（氏名）
+      OUTPUT_COL: Q          # IJF URL出力列
+      JUDOINSIDE_COL: P      # JudoInside URL出力列
+      BIRTH_COL: M           # 誕生日出力列
+
+      # ====== 行範囲 ======
+      START_ROW: 2
+      END_ROW: 3500
+
+      # ====== 機能ON/OFF ======
+      ENABLE_JUDOINSIDE: "1"
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          pip install --upgrade pip
+          pip install gspread google-auth requests beautifulsoup4
 
-      - name: Create credentials file
+      - name: Create credentials.json
         run: |
-          cat > credentials.json << 'EOF'
+          cat << 'EOF' > credentials.json
           ${{ secrets.GOOGLE_CREDENTIALS }}
           EOF
 
       - name: Run script
-        run: python -u main.py
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: credentials.json
-          PYTHONUNBUFFERED: "1"
-
-          SPREADSHEET_URL: ${{ inputs.spreadsheet_url }}
-          SHEET_NAME: ${{ inputs.sheet_name }}
-
-          START_ROW: ${{ inputs.start_row }}
-          END_ROW: ${{ inputs.end_row }}
-
-          SEARCH_COL: ${{ inputs.search_col }}
-          OUTPUT_COL: ${{ inputs.output_col }}
-
-          BATCH_SIZE: ${{ inputs.batch_size }}
-          SLEEP_SEC: ${{ inputs.sleep_sec }}
+        run: |
+          python -u main.py
