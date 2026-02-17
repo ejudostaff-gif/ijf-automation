@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlencode
 
 import gspread
@@ -25,6 +25,17 @@ JUDOINSIDE_COL = os.getenv("JUDOINSIDE_COL", "P")  # JudoInside
 BIRTH_COL = os.getenv("BIRTH_COL", "M")
 
 ENABLE_JUDOINSIDE = os.getenv("ENABLE_JUDOINSIDE", "0") == "1"
+
+
+# ==============================
+# HTTP 共通（ブロック回避寄り）
+# ==============================
+
+SESSION = requests.Session()
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 # ==============================
@@ -57,9 +68,9 @@ def normalize_name(name: str) -> str:
 
 def swap_name(name: str) -> str:
     if "," in name:
-        parts = [p.strip() for p in name.split(",")]
+        parts = [p.strip() for p in name.split(",", 1)]
         if len(parts) == 2:
-            return f"{parts[1]} {parts[0]}"
+            return f"{parts[1]} {parts[0]}".strip()
     return name
 
 
@@ -73,7 +84,7 @@ def search_ijf(name: str) -> Optional[str]:
     url = f"{base}?{params}"
 
     try:
-        r = requests.get(url, timeout=10)
+        r = SESSION.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
             return None
 
@@ -92,38 +103,87 @@ def search_ijf(name: str) -> Optional[str]:
 # JudoInside検索
 # ==============================
 
-def search_judoinside(name: str):
+def parse_birth_any(text: str) -> Optional[str]:
+    """
+    JudoInside は表記揺れがあるので、いくつかの形式を拾う。
+    返す形式は yyyy/m/d（ゼロ埋めなし）。
+    """
+    # 例: 2002-01-17
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return f"{y}/{mo}/{d}"
+
+    # 例: 17 Jan 2002 / 17 January 2002
+    m = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\b", text)
+    if m:
+        d = int(m.group(1))
+        mon = m.group(2).lower()
+        y = int(m.group(3))
+        months = {
+            "jan": 1, "january": 1,
+            "feb": 2, "february": 2,
+            "mar": 3, "march": 3,
+            "apr": 4, "april": 4,
+            "may": 5,
+            "jun": 6, "june": 6,
+            "jul": 7, "july": 7,
+            "aug": 8, "august": 8,
+            "sep": 9, "sept": 9, "september": 9,
+            "oct": 10, "october": 10,
+            "nov": 11, "november": 11,
+            "dec": 12, "december": 12,
+        }
+        if mon in months:
+            mo = months[mon]
+            return f"{y}/{mo}/{d}"
+
+    return None
+
+
+def search_judoinside(name: str) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    戻り値: (profile_url, birth_yyyy/m/d, status_text)
+    status_text はログ用
+    """
     search_url = "https://judoinside.com/search"
     params = urlencode({"q": name})
     url = f"{search_url}?{params}"
 
     try:
-        r = requests.get(url, timeout=10)
+        r = SESSION.get(url, headers=HEADERS, timeout=15)
+        if r.status_code in (403, 429):
+            return None, None, f"BLOCKED status={r.status_code}"
         if r.status_code != 200:
-            return None, None
+            return None, None, f"HTTP status={r.status_code}"
 
         soup = BeautifulSoup(r.text, "html.parser")
-        link = soup.find("a", href=re.compile(r"/judoka/\d+/"))
 
+        # /judoka/111259/Assunta_Scutto/judo-career のようなリンクも拾う
+        link = soup.find("a", href=re.compile(r"/judoka/\d+/"))
         if not link:
-            return None, None
+            # デバッグ用に「検索結果っぽい文言」があるかだけ確認
+            t = soup.get_text(" ", strip=True)[:200]
+            return None, None, f"NO_LINK (page_text='{t}')"
 
         profile_url = "https://judoinside.com" + link["href"]
 
-        # 生年月日取得
-        r2 = requests.get(profile_url, timeout=10)
+        r2 = SESSION.get(profile_url, headers=HEADERS, timeout=15)
+        if r2.status_code in (403, 429):
+            return profile_url, None, f"PROFILE_BLOCKED status={r2.status_code}"
+        if r2.status_code != 200:
+            return profile_url, None, f"PROFILE_HTTP status={r2.status_code}"
+
         soup2 = BeautifulSoup(r2.text, "html.parser")
+        text2 = soup2.get_text(" ", strip=True)
 
-        birth = None
-        text = soup2.get_text()
-        m = re.search(r"Born\s*:\s*(\d{4}-\d{2}-\d{2})", text)
-        if m:
-            birth = m.group(1).replace("-", "/")
+        # Born キーワードの近辺が無い場合もあるので全文から拾う
+        birth = parse_birth_any(text2)
 
-        return profile_url, birth
+        return profile_url, birth, "OK"
 
-    except Exception:
-        return None, None
+    except Exception as e:
+        return None, None, f"EXCEPTION {type(e).__name__}"
 
 
 # ==============================
@@ -131,11 +191,12 @@ def search_judoinside(name: str):
 # ==============================
 
 def main():
-    print("=== START main() ===")
-    print(f"Config: SEARCH_COL={SEARCH_COL} OUTPUT_COL={OUTPUT_COL}")
+    print("=== START main() ===", flush=True)
+    print(f"Config: SEARCH_COL={SEARCH_COL} OUTPUT_COL={OUTPUT_COL} "
+          f"JUDOINSIDE_COL={JUDOINSIDE_COL} BIRTH_COL={BIRTH_COL} ENABLE_JUDOINSIDE={ENABLE_JUDOINSIDE}", flush=True)
 
     ws = open_worksheet()
-    print("Opened worksheet")
+    print("Opened worksheet", flush=True)
 
     names = ws.get(f"{SEARCH_COL}{START_ROW}:{SEARCH_COL}{END_ROW}")
     q_vals = ws.get(f"{OUTPUT_COL}{START_ROW}:{OUTPUT_COL}{END_ROW}")
@@ -143,7 +204,10 @@ def main():
     m_vals = ws.get(f"{BIRTH_COL}{START_ROW}:{BIRTH_COL}{END_ROW}")
 
     total = len(names)
-    found = 0
+    checked = 0
+    found_ijf = 0
+    found_ji = 0
+    found_birth = 0
 
     for i in range(total):
         row = START_ROW + i
@@ -155,44 +219,54 @@ def main():
         if not original_name:
             continue
 
-        # 既にIJFが入っている場合スキップ
-        if i < len(q_vals) and q_vals[i] and q_vals[i][0].strip():
-            continue
+        checked += 1
 
         name = normalize_name(original_name)
-        swapped = swap_name(original_name)
+        swapped = normalize_name(swap_name(original_name))
 
-        print(f"Search IJF: row={row} q='{name}'")
+        # ---- IJF ----
+        already_q = (i < len(q_vals) and q_vals[i] and q_vals[i][0].strip())
+        if not already_q:
+            print(f"Search IJF: row={row} q='{name}'", flush=True)
+            ijf_url = search_ijf(name)
+            if not ijf_url and swapped != name:
+                print(f"Search IJF: row={row} q='{swapped}'", flush=True)
+                ijf_url = search_ijf(swapped)
 
-        ijf_url = search_ijf(name)
-        if not ijf_url and swapped != name:
-            print(f"Search IJF: row={row} q='{swapped}'")
-            ijf_url = search_ijf(swapped)
+            if ijf_url:
+                ws.update_acell(f"{OUTPUT_COL}{row}", ijf_url)
+                found_ijf += 1
+                print(f"FOUND IJF row={row}", flush=True)
+            else:
+                print(f"NOT FOUND IJF row={row}", flush=True)
 
-        if ijf_url:
-            ws.update_acell(f"{OUTPUT_COL}{row}", ijf_url)
-            found += 1
-            print(f"FOUND IJF row={row}")
-        else:
-            print(f"NOT FOUND IJF row={row}")
-
+        # ---- JudoInside + Birth ----
         if ENABLE_JUDOINSIDE:
-            if i < len(p_vals) and p_vals[i] and p_vals[i][0].strip():
-                continue
+            already_p = (i < len(p_vals) and p_vals[i] and p_vals[i][0].strip())
+            already_m = (i < len(m_vals) and m_vals[i] and m_vals[i][0].strip())
 
-            ji_url, birth = search_judoinside(name)
+            if (not already_p) or (not already_m):
+                print(f"Search JudoInside: row={row} q='{name}'", flush=True)
+                ji_url, birth, status = search_judoinside(name)
+                if (not ji_url) and swapped != name:
+                    print(f"Search JudoInside: row={row} q='{swapped}'", flush=True)
+                    ji_url, birth, status = search_judoinside(swapped)
 
-            if ji_url:
-                ws.update_acell(f"{JUDOINSIDE_COL}{row}", ji_url)
-                print(f"FOUND JI row={row}")
+                print(f"JudoInside result: row={row} status={status}", flush=True)
 
-            if birth:
-                ws.update_acell(f"{BIRTH_COL}{row}", birth)
-                print(f"BIRTH row={row}")
+                if ji_url and (not already_p):
+                    ws.update_acell(f"{JUDOINSIDE_COL}{row}", ji_url)
+                    found_ji += 1
+                    print(f"WRITE P row={row}", flush=True)
+
+                if birth and (not already_m):
+                    ws.update_acell(f"{BIRTH_COL}{row}", birth)
+                    found_birth += 1
+                    print(f"WRITE M row={row} birth={birth}", flush=True)
 
         time.sleep(0.5)
 
-    print(f"=== DONE checked={total} found={found} ===")
+    print(f"=== DONE checked={checked} IJF={found_ijf} JI={found_ji} BIRTH={found_birth} ===", flush=True)
 
 
 if __name__ == "__main__":
