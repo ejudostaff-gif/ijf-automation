@@ -2,6 +2,15 @@ name: IJF Automation
 
 on:
   workflow_dispatch:
+    inputs:
+      spreadsheet:
+        description: "スプレッドシート"
+        required: true
+        type: choice
+        options:
+          - main
+          - test
+
   schedule:
     - cron: "0 */6 * * *"
 
@@ -26,9 +35,16 @@ jobs:
         run: |
           echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT }}' > credentials.json
 
+      - name: Select Spreadsheet
+        run: |
+          if [ "${{ github.event.inputs.spreadsheet }}" = "main" ]; then
+            echo "SPREADSHEET_URL=${{ vars.SPREADSHEET_MAIN }}" >> $GITHUB_ENV
+          else
+            echo "SPREADSHEET_URL=${{ vars.SPREADSHEET_TEST }}" >> $GITHUB_ENV
+          fi
+
       - name: Run script
         env:
-          SPREADSHEET_URL: ${{ vars.SPREADSHEET_URL }}
           SHEET_NAME: ${{ vars.SHEET_NAME }}
 
           START_ROW: ${{ vars.START_ROW }}
