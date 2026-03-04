@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from urllib.parse import urlencode
 
 import gspread
@@ -43,6 +43,11 @@ HEADERS = {
 # ==============================
 
 def open_worksheet():
+    if not SPREADSHEET_URL:
+        raise RuntimeError("SPREADSHEET_URL が空です（env に設定してください）")
+    if not SHEET_NAME:
+        raise RuntimeError("SHEET_NAME が空です（env に設定してください）")
+
     creds = Credentials.from_service_account_file(
         "credentials.json",
         scopes=[
@@ -75,13 +80,86 @@ def swap_name(name: str) -> str:
 
 
 # ==============================
-# IJF検索
+# マッチ用 正規化 & 類似度
 # ==============================
 
+def _norm_for_match(s: str) -> str:
+    s = s.lower()
+    # 記号を空白化
+    s = re.sub(r"[\(\)\[\]\{\},\.;:!?'\"/\\|@#%^&*_+=<>~`]", " ", s)
+    # ダッシュ類を空白化
+    s = re.sub(r"[-–—]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _tokens(s: str) -> List[str]:
+    s = _norm_for_match(s)
+    if not s:
+        return []
+    # 1文字トークンは落とす（ノイズ対策）
+    toks = [t for t in s.split(" ") if len(t) >= 2]
+    return toks
+
+
+def _jaccard(a: List[str], b: List[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+# ==============================
+# IJF検索（誤マッチ抑止版）
+# ==============================
+
+def _extract_ijf_name_from_judoka_page(html: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # まず og:title があれば優先（例: "Surname Name - IJF.org" 的なもの）
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        t = og["content"].strip()
+        # "- IJF" など余計な後ろを削る
+        t = re.split(r"\s*[-|]\s*IJF", t, flags=re.IGNORECASE)[0].strip()
+        if t:
+            return t
+
+    # 次に h1/h2 などそれっぽい見出し
+    for tag in ["h1", "h2"]:
+        h = soup.find(tag)
+        if h:
+            t = h.get_text(" ", strip=True)
+            if t and len(t) >= 3:
+                return t
+
+    return None
+
+
+def _fetch_ijf_judoka_name(url: str) -> Optional[str]:
+    try:
+        r = SESSION.get(url, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return None
+        return _extract_ijf_name_from_judoka_page(r.text)
+    except Exception:
+        return None
+
+
 def search_ijf(name: str) -> Optional[str]:
+    """
+    旧実装の問題:
+      soup.find() でページ内の最初の /judoka/数字 を拾うと、
+      固定リンク（例: /judoka/3039）が紛れた場合に誤マッチする。
+
+    対策:
+      1) 検索結果ページから候補 /judoka/ID を複数拾う
+      2) 各候補の judoka ページを軽く取得し、表示名を抽出
+      3) 入力 name と一致度（トークンJaccard）で選ぶ
+      4) しきい値未満なら None（嘘は入れない）
+    """
     base = "https://www.ijf.org/judoka"
-    params = urlencode({"q": name})
-    url = f"{base}?{params}"
+    url = f"{base}?{urlencode({'q': name})}"
 
     try:
         r = SESSION.get(url, headers=HEADERS, timeout=15)
@@ -89,9 +167,64 @@ def search_ijf(name: str) -> Optional[str]:
             return None
 
         soup = BeautifulSoup(r.text, "html.parser")
-        link = soup.find("a", href=re.compile(r"/judoka/\d+"))
-        if link:
-            return "https://www.ijf.org" + link["href"]
+
+        # 候補を全部拾う（短いhref優先: /judoka/12345）
+        hrefs = []
+        seen = set()
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not href.startswith("/judoka/"):
+                continue
+
+            # まず /judoka/数字 だけを優先
+            if re.fullmatch(r"/judoka/\d+", href):
+                if href not in seen:
+                    seen.add(href)
+                    hrefs.append(href)
+
+        # フォールバック: /judoka/数字/anything も拾う（ただし後回し）
+        if not hrefs:
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if re.match(r"^/judoka/\d+", href):
+                    base_href = re.search(r"^/judoka/\d+", href).group(0)
+                    if base_href not in seen:
+                        seen.add(base_href)
+                        hrefs.append(base_href)
+
+        if not hrefs:
+            return None
+
+        # 最大この数だけ候補チェック（重くしすぎない）
+        MAX_CANDIDATES = 6
+        hrefs = hrefs[:MAX_CANDIDATES]
+
+        q_tokens = _tokens(name)
+        best_url = None
+        best_score = 0.0
+        best_display = None
+
+        for href in hrefs:
+            cand_url = "https://www.ijf.org" + href
+            disp = _fetch_ijf_judoka_name(cand_url)
+            if not disp:
+                continue
+
+            score = _jaccard(q_tokens, _tokens(disp))
+            if score > best_score:
+                best_score = score
+                best_url = cand_url
+                best_display = disp
+
+        # しきい値（経験則）：0.55 未満は危険なので入れない
+        THRESHOLD = 0.55
+
+        # ログに出せるように（呼び出し元で print したい場合はここで返す設計も可）
+        # print(f"DEBUG IJF best_score={best_score:.2f} best='{best_display}' url={best_url}")
+
+        if best_url and best_score >= THRESHOLD:
+            return best_url
 
     except Exception:
         return None
@@ -159,10 +292,8 @@ def search_judoinside(name: str) -> Tuple[Optional[str], Optional[str], str]:
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # /judoka/111259/Assunta_Scutto/judo-career のようなリンクも拾う
         link = soup.find("a", href=re.compile(r"/judoka/\d+/"))
         if not link:
-            # デバッグ用に「検索結果っぽい文言」があるかだけ確認
             t = soup.get_text(" ", strip=True)[:200]
             return None, None, f"NO_LINK (page_text='{t}')"
 
@@ -177,9 +308,7 @@ def search_judoinside(name: str) -> Tuple[Optional[str], Optional[str], str]:
         soup2 = BeautifulSoup(r2.text, "html.parser")
         text2 = soup2.get_text(" ", strip=True)
 
-        # Born キーワードの近辺が無い場合もあるので全文から拾う
         birth = parse_birth_any(text2)
-
         return profile_url, birth, "OK"
 
     except Exception as e:
@@ -192,8 +321,11 @@ def search_judoinside(name: str) -> Tuple[Optional[str], Optional[str], str]:
 
 def main():
     print("=== START main() ===", flush=True)
-    print(f"Config: SEARCH_COL={SEARCH_COL} OUTPUT_COL={OUTPUT_COL} "
-          f"JUDOINSIDE_COL={JUDOINSIDE_COL} BIRTH_COL={BIRTH_COL} ENABLE_JUDOINSIDE={ENABLE_JUDOINSIDE}", flush=True)
+    print(
+        f"Config: SEARCH_COL={SEARCH_COL} OUTPUT_COL={OUTPUT_COL} "
+        f"JUDOINSIDE_COL={JUDOINSIDE_COL} BIRTH_COL={BIRTH_COL} ENABLE_JUDOINSIDE={ENABLE_JUDOINSIDE}",
+        flush=True
+    )
 
     ws = open_worksheet()
     print("Opened worksheet", flush=True)
@@ -229,6 +361,7 @@ def main():
         if not already_q:
             print(f"Search IJF: row={row} q='{name}'", flush=True)
             ijf_url = search_ijf(name)
+
             if not ijf_url and swapped != name:
                 print(f"Search IJF: row={row} q='{swapped}'", flush=True)
                 ijf_url = search_ijf(swapped)
@@ -236,7 +369,7 @@ def main():
             if ijf_url:
                 ws.update_acell(f"{OUTPUT_COL}{row}", ijf_url)
                 found_ijf += 1
-                print(f"FOUND IJF row={row}", flush=True)
+                print(f"FOUND IJF row={row} -> {ijf_url}", flush=True)
             else:
                 print(f"NOT FOUND IJF row={row}", flush=True)
 
