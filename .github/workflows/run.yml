@@ -2,88 +2,43 @@ name: IJF Automation
 
 on:
   workflow_dispatch:
-    inputs:
-      spreadsheet_url:
-        description: "Google Spreadsheet URL（例：https://docs.google.com/spreadsheets/d/.../edit）"
-        required: true
-        type: string
-      sheet_name:
-        description: "シート名（タブ名）"
-        required: true
-        default: "データベース"
-        type: string
-      start_row:
-        description: "開始行"
-        required: true
-        default: "2"
-        type: string
-      end_row:
-        description: "終了行"
-        required: true
-        default: "3000"
-        type: string
-      search_col:
-        description: "検索列（氏名）"
-        required: true
-        default: "F"
-        type: string
-      output_col:
-        description: "IJF URL 出力列"
-        required: true
-        default: "Q"
-        type: string
-      judoinside_col:
-        description: "JudoInside URL 出力列"
-        required: true
-        default: "P"
-        type: string
-      birth_col:
-        description: "誕生日 出力列"
-        required: true
-        default: "M"
-        type: string
-      enable_judoinside:
-        description: "JudoInside検索を有効化（1=ON, 0=OFF）"
-        required: true
-        default: "1"
-        type: string
+  schedule:
+    - cron: "0 */6 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
-    env:
-      # === 実行時入力を env に渡す（前回形式）===
-      SPREADSHEET_URL: ${{ github.event.inputs.spreadsheet_url }}
-      SHEET_NAME: ${{ github.event.inputs.sheet_name }}
-      START_ROW: ${{ github.event.inputs.start_row }}
-      END_ROW: ${{ github.event.inputs.end_row }}
-      SEARCH_COL: ${{ github.event.inputs.search_col }}
-      OUTPUT_COL: ${{ github.event.inputs.output_col }}
-      JUDOINSIDE_COL: ${{ github.event.inputs.judoinside_col }}
-      BIRTH_COL: ${{ github.event.inputs.birth_col }}
-      ENABLE_JUDOINSIDE: ${{ github.event.inputs.enable_judoinside }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install gspread google-auth requests beautifulsoup4
+          pip install requests beautifulsoup4 gspread google-auth
 
-      - name: Create credentials.json
+      - name: Write credentials.json
         run: |
-          cat << 'EOF' > credentials.json
-          ${{ secrets.GOOGLE_CREDENTIALS }}
-          EOF
+          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT }}' > credentials.json
 
       - name: Run script
+        env:
+          SPREADSHEET_URL: ${{ vars.SPREADSHEET_URL }}
+          SHEET_NAME: ${{ vars.SHEET_NAME }}
+
+          START_ROW: ${{ vars.START_ROW }}
+          END_ROW: ${{ vars.END_ROW }}
+
+          FULLNAME_COL: ${{ vars.FULLNAME_COL }}
+          FAMILY_COL: ${{ vars.FAMILY_COL }}
+          GIVEN_COL: ${{ vars.GIVEN_COL }}
+
+          OUTPUT_COL: ${{ vars.OUTPUT_COL }}
+
         run: |
           python -u main.py
