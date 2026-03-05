@@ -1,60 +1,92 @@
-name: IJF Automation
+name: IJF Search
 
 on:
+
   workflow_dispatch:
+
     inputs:
-      spreadsheet:
-        description: "スプレッドシート"
+
+      sheet:
+
+        description: "Sheet"
+
         required: true
+
         type: choice
+
         options:
+
           - MAN
+
           - WOMAN
 
   schedule:
+
     - cron: "0 */6 * * *"
 
+
 jobs:
+
   run:
+
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+    steps:
+
+      - uses: actions/checkout@v4
+
+
+      - uses: actions/setup-python@v5
+
         with:
+
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          pip install requests beautifulsoup4 gspread google-auth
 
-      - name: Write credentials.json
-        run: |
-          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT }}' > credentials.json
+      - name: install
 
-      - name: Select Spreadsheet
+        run: pip install -r requirements.txt
+
+
+      - name: create credentials
+
+        run: echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT }}' > credentials.json
+
+
+      - name: select sheet
+
         run: |
-          if [ "${{ github.event.inputs.spreadsheet }}" = "main" ]; then
-            echo "SPREADSHEET_URL=${{ vars.SPREADSHEET_MAIN }}" >> $GITHUB_ENV
+
+          if [ "${{ github.event.inputs.sheet }}" = "MAN" ]; then
+
+            echo "SPREADSHEET_URL=https://docs.google.com/spreadsheets/d/1Fzgqgqv3zOKE36v7DCMp-z4JGSDHhVv0b5JEgjQmx5k" >> $GITHUB_ENV
+
           else
-            echo "SPREADSHEET_URL=${{ vars.SPREADSHEET_TEST }}" >> $GITHUB_ENV
+
+            echo "SPREADSHEET_URL=https://docs.google.com/spreadsheets/d/1SwjfDRfcikHrNo38CgFjwBa_oWQM5pnGynFeqikeVU4" >> $GITHUB_ENV
+
           fi
 
-      - name: Run script
+
+      - name: run script
+
         env:
-          SHEET_NAME: ${{ vars.SHEET_NAME }}
 
-          START_ROW: ${{ vars.START_ROW }}
-          END_ROW: ${{ vars.END_ROW }}
+          SHEET_NAME: Sheet1
 
-          FULLNAME_COL: ${{ vars.FULLNAME_COL }}
-          FAMILY_COL: ${{ vars.FAMILY_COL }}
-          GIVEN_COL: ${{ vars.GIVEN_COL }}
+          START_ROW: 2
 
-          OUTPUT_COL: ${{ vars.OUTPUT_COL }}
+          END_ROW: 1000
+
+          FULLNAME_COL: K
+
+          FAMILY_COL: I
+
+          GIVEN_COL: J
+
+          OUTPUT_COL: Q
 
         run: |
-          python -u main.py
+
+          python main.py
