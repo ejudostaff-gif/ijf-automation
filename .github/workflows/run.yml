@@ -8,8 +8,8 @@ on:
         required: true
         type: choice
         options:
-          - main
-          - test
+          - MAN
+          - WOMAN
 
   schedule:
     - cron: "0 */6 * * *"
